@@ -195,3 +195,9 @@ class DataAppConfiguration(ComponentConfiguration):
         description='Authorization configuration for the data app',
         default=None
     )
+    component: Optional[Component] = Field(
+        description='The Keboola component.',
+        validation_alias=AliasChoices('component'),
+        serialization_alias='component',
+        default=None,
+    )

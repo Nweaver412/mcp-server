@@ -22,6 +22,7 @@ from keboola_mcp_server.tools.components.utils import (
 )
 from keboola_mcp_server.tools.storage import retrieve_buckets, retrieve_bucket_tables
 from keboola_mcp_server.tools.sql import get_sql_dialect, query_table
+from keboola_mcp_server.tools.components.prompt import DataAppPrompt
 
 LOG = logging.getLogger(__name__)
 
@@ -356,52 +357,8 @@ async def _generate_data_app_script(
     Returns:
         List of script lines
     """    
-    # Create a prompt for Claude that includes data context
-    # TODO: Make sure libraries that need to be used but are not in the list below are added to packages
-    # Use: - If any libraries are missing, add them to the packages list in config
-
-    prompt = f"""Generate a Streamlit script for a data app named '{name}' that {description}.
-
-User Query: {user_query if user_query else 'No specific query provided'}
-
-Pre-installed Libraries:
-- streamlit
-- pandas
-- numpy
-- plotly
-- matplotlib
-- seaborn
-- scikit-learn
-- altair
-- streamlit-aggrid
-- streamlit-authenticator
-- streamlit-keboola-api
-- pydeck
-- extra-streamlit-components
-
-Requirements:
-- Use Streamlit for data visualization or interaction
-- Include proper error handling
-- Add helpful comments
-- Follow Python best practices
-- Use Keboola's CommonInterface for data access:
-   - Use ci = CommonInterface() for data access
-   - Use ci.get_input_tables_definitions() to get table definitions
-   - Use ci.get_input_tables() to read data
-   - Handle table paths and CSV reading properly
-- Make the UI clean and user-friendly
-- Include data validation and error handling for missing or invalid data
-- Add appropriate visualizations based on the data types
-- Include filters and interactive elements where appropriate
-
-
-Please provide only the Python code, no explanations. The code should:
-- Initialize Keboola CommonInterface for data access
-- Handle the specific data tables mentioned in the user query or description
-- Create appropriate visualizations based on the data
-- Include proper error handling for data access and processing
-- Follow Streamlit best practices for UI/UX
-- Use proper Keboola data access patterns"""
+    # Get the prompt template for generating the data app
+    prompt = DataAppPrompt.format(name, description, user_query)
 
     # Use Claude to generate the data app
     response = await ctx.generate(prompt)
@@ -416,8 +373,6 @@ Please provide only the Python code, no explanations. The code should:
     
     return script_lines
     
-
-
 
 async def create_data_app(
     ctx: Context,
@@ -439,24 +394,30 @@ async def create_data_app(
             description='Unique identifier for the data app (e.g., "my-data-app").',
         ),
     ],
+    script: Annotated[
+        str,
+        Field(
+            description='Python script for the data app as a single string.',
+        ),
+    ],
     user_query: Annotated[
         Optional[str],
         Field(
             description='Optional query about what data to use in the data app.',
         ),
     ] = None,
-    script: Annotated[
-        Optional[Sequence[str]],
+    packages: Annotated[
+        Optional[List[str]],
         Field(
-            description='List of Python script lines that make up the data app. If not provided, Claude will generate a script based on the description and data context.',
+            description='List of Python packages to install in the data app.',
         ),
     ] = None,
     size: Annotated[
         str,
         Field(
-            description='Size of the data app instance (tiny, small, medium, large).',
+            description='Size of the data app instance (small, medium, large).',
         ),
-    ] = 'tiny',
+    ] = 'small',
     auto_suspend_after_seconds: Annotated[
         int,
         Field(
@@ -476,41 +437,30 @@ async def create_data_app(
     ),
 ]:
     """
-    Creates a new data app with the specified configuration. If no script is provided,
-    Claude will generate one based on the description and available data context.
+    Creates a new data app with the specified configuration.
     
     USAGE:
         - Use when you want to create a new data app in Keboola.
-        - Use when you want Claude to generate a script based on available data.
         
     EXAMPLES:
-        - user_input: "Create a data app that visualizes sales data from the sales bucket"
-            - set description to explain the visualization needs
-            - set user_query to specify which data to use
-            - Claude will generate an appropriate script using the actual data
         - user_input: "Create a data app with this specific script"
-            - provide the script directly
-            - returns the created data app configuration
+            -> provide the script directly
+            -> returns the created data app configuration
     """
     client = KeboolaClient.from_state(ctx.session.state)
-    
-    # If no script is given, use chat agent to generate one
-    if not script:
-        script = await _generate_data_app_script(ctx, name, description, user_query)
-        LOG.info(f"Generating using agent...")
     
     # General Config
     data_app = DataApp(
         slug=slug,
-        script=list(script),
+        script=[script],
         size=size,
         autoSuspendAfterSeconds=auto_suspend_after_seconds,
-        streamlit=streamlit_config or { # Default keboola streamlit config
+        streamlit=streamlit_config or {
             "config.toml": "[theme]\nfont = \"sans serif\"\ntextColor = \"#222529\"\nbackgroundColor = \"#FFFFFF\"\nsecondaryBackgroundColor = \"#E6F2FF\"\nprimaryColor = \"#1F8FFF\""
         }
     )
     
-    # Basic Component Configuration
+    # Component Configuration
     configuration = {
         'name': name,
         'description': description,
@@ -518,9 +468,13 @@ async def create_data_app(
             'parameters': {
                 'size': size,
                 'autoSuspendAfterSeconds': auto_suspend_after_seconds,
-                'dataApp': data_app.model_dump(),
-                'id': slug,
-                'script': script
+                'dataApp': {
+                    'slug': slug,
+                    'streamlit': streamlit_config or {
+                        "config.toml": "[theme]\nfont = \"sans serif\"\ntextColor = \"#222529\"\nbackgroundColor = \"#FFFFFF\"\nsecondaryBackgroundColor = \"#E6F2FF\"\nprimaryColor = \"#1F8FFF\""
+                    }
+                },
+                'script': [script]
             },
             'authorization': {
                 'app_proxy': {
@@ -534,34 +488,51 @@ async def create_data_app(
                     ]
                 }
             }
-        }
+        },
+        'rows': [],
+        'rowsSortOrder': [],
+        'state': {},
+        'version': 1,
+        'isDeleted': False,
+        'isDisabled': False,
+        'changeDescription': 'Create data app'
     }
     
-    # Get the data app component ID
-    component_id = 'keboola.app-data-app' 
-    
+    component_id = 'keboola.data-apps'
     endpoint = f'branch/{client.storage_client_sync._branch_id}/components/{component_id}/configs'
+    new_raw_configuration = await client.storage_client.post(endpoint, data=configuration)
     
-    try:
-        new_raw_configuration = await client.storage_client.post(endpoint, data=configuration)
-        
-        # Get component details
-        component = await _get_component_details(client=client, component_id=component_id)
-        
-        # Create and return the data app configuration
-        new_configuration = DataAppConfiguration(
-            **new_raw_configuration,
-            component_id=component_id,
-            component=component,
-            data_app=data_app,
-            authorization=configuration['configuration']['authorization']
-        )
-        
-        LOG.info(f'Created new data app "{name}" with configuration id "{new_configuration.configuration_id}".')
-        return new_configuration
-        
-    except Exception as e:
-        LOG.exception(f'Error when creating new data app configuration: {e}')
-        raise e
+    # Configure id and parameters id
+    config_id = new_raw_configuration['id']
+    config_id_num = int(config_id)
+    parameters_id = str(config_id_num + 1)
+    
+    # Update the configuration with the response data
+    configuration.update({
+        'id': config_id,
+        'created': new_raw_configuration.get('created'),
+        'creatorToken': new_raw_configuration.get('creatorToken'),
+        'currentVersion': new_raw_configuration.get('currentVersion'),
+        'version': new_raw_configuration.get('version', 1)
+    })
+    configuration['configuration']['parameters']['id'] = parameters_id
+    
+    data_apps_endpoint = f'data-apps/{slug}'
+    await client.storage_client.post(data_apps_endpoint, data={
+        'configurationId': new_raw_configuration['id'],
+        'componentId': component_id
+    })
+    LOG.info(f'Registered data app "{name}" with Data Apps service.')
+    
+    # Create and return the data app configuration
+    new_configuration = DataAppConfiguration(
+        **configuration,
+        component_id=component_id,
+        data_app=data_app,
+        authorization=configuration['configuration']['authorization']
+    )
+    
+    LOG.info(f'Created new data app "{name}" with configuration id "{new_configuration.configuration_id}".')
+    return new_configuration
 
 ############################## End of component tools #########################################
